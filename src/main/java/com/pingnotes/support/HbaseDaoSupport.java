@@ -5,7 +5,6 @@ import com.pingnotes.annotation.Column;
 import com.pingnotes.annotation.JsonField;
 import com.pingnotes.annotation.MapField;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -13,36 +12,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.InputStream;
+import java.lang.annotation.Annotation;
 import java.lang.annotation.IncompleteAnnotationException;
 import java.lang.reflect.Field;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.NavigableMap;
-import java.util.Properties;
+
 
 /**
  * Created by shaobo on 7/29/16.
  */
 public class HbaseDaoSupport<T extends HbaseBaseDo> {
     private final static Logger LOG = LoggerFactory.getLogger(HbaseDaoSupport.class);
-    private static Configuration conf;
-    private static final String ADDR = "hbase.zookeeper.quorum";
-    private static final String PORT = "hbase.zookeeper.property.clientPort";
-
-    static {
-        Properties prop = new Properties();
-        InputStream is = HbaseDaoSupport.class.getClassLoader().getResourceAsStream("hbase.properties");
-        try {
-            prop.load(is);
-            conf = HBaseConfiguration.create();
-            conf.set(ADDR, prop.getProperty(ADDR));
-            conf.set(PORT, prop.getProperty(PORT));
-        } catch (IOException e) {
-            LOG.error("load config error", e);
-            System.exit(-1);
-        }
-    }
+    private static Configuration conf = HbaseConfig.getConfig();
 
     private String tableName;
     private Class<?> clz;
@@ -63,9 +46,9 @@ public class HbaseDaoSupport<T extends HbaseBaseDo> {
             table = connection.getTable(TableName.valueOf(tableName));
             table.put(doPut(obj));
         } catch (IOException e) {
-            LOG.error("some error", e);
+            LOG.error("connection error when insert", e);
         } catch (IllegalAccessException e) {
-            LOG.error("some error", e);
+            LOG.error("put field error when insert", e);
         } finally {
             closeAll(table, connection);
         }
@@ -83,7 +66,7 @@ public class HbaseDaoSupport<T extends HbaseBaseDo> {
             Delete del = new Delete(rowkey.getBytes());
             table.delete(del);
         } catch (IOException e) {
-            LOG.error("some error", e);
+            LOG.error("connection error when delete", e);
         } finally {
             closeAll(table, connection);
         }
@@ -104,7 +87,6 @@ public class HbaseDaoSupport<T extends HbaseBaseDo> {
             Put put = new Put(obj.rowKeyBytes(), now + 1);
             for (Field field : obj.getClass().getDeclaredFields()) {
                 field.setAccessible(true);
-                columnCheck(field);
                 if (field.isAnnotationPresent(JsonField.class)) {
                     jsonBytesPut(put, obj, field);
                 } else if (field.isAnnotationPresent(MapField.class)) {
@@ -243,11 +225,16 @@ public class HbaseDaoSupport<T extends HbaseBaseDo> {
      * @throws IllegalAccessException
      */
     private Put pojoPut(Put put, final T obj, final Field field) throws IllegalAccessException {
-        columnCheck(field);
-        fieldNullCheck(obj, field);
-        String family = field.getAnnotation(Column.class).family();
-        String qualifier = field.getAnnotation(Column.class).qualifier();
+        if (!field.isAnnotationPresent(Column.class)) {
+            return put;
+        }
+        Column column = field.getAnnotation(Column.class);
+        String family = column.family();
+        String qualifier = column.qualifier();
         Object fieldObj = field.get(obj);
+        if (family.isEmpty() || qualifier.isEmpty() || fieldObj == null) {
+            return put;
+        }
         if (fieldObj instanceof Integer) {
             put.addColumn(family.getBytes(), qualifier.getBytes(), Bytes.toBytes((Integer) fieldObj));
         } else if (fieldObj instanceof Boolean) {
@@ -278,10 +265,18 @@ public class HbaseDaoSupport<T extends HbaseBaseDo> {
      * @throws IllegalAccessException
      */
     private Put jsonBytesPut(Put put, final T obj, final Field field) throws IllegalAccessException {
-        fieldNullCheck(obj, field);
-        String family = field.getAnnotation(Column.class).family();
-        String qualifier = field.getAnnotation(Column.class).qualifier();
-        put.addColumn(family.getBytes(), qualifier.getBytes(), JSON.toJSONBytes(field.get(obj)));
+        if (!field.isAnnotationPresent(Column.class)) {
+            return put;
+        }
+        Column column = field.getAnnotation(Column.class);
+        if (column.family().isEmpty() || column.qualifier().isEmpty()) {
+            return put;
+        }
+        Object var = field.get(obj);
+        if (var == null) {
+            return put;
+        }
+        put.addColumn(column.family().getBytes(), column.qualifier().getBytes(), JSON.toJSONBytes(var));
         return put;
     }
 
@@ -295,10 +290,18 @@ public class HbaseDaoSupport<T extends HbaseBaseDo> {
      * @throws IllegalAccessException
      */
     private Put mapPut(Put put, final T obj, final Field field) throws IllegalAccessException {
-        fieldNullCheck(obj, field);
-
+        if (!field.isAnnotationPresent(Column.class)) {
+            return put;
+        }
         String family = field.getAnnotation(Column.class).family();
+        if (family.isEmpty()) {
+            return put;
+        }
+
         Map<Object, Object> mp = (Map<Object, Object>) field.get(obj);
+        if (mp == null || mp.isEmpty()) {
+            return put;
+        }
         for (Map.Entry<Object, Object> entry : mp.entrySet()) {
             put.addColumn(family.getBytes(), typeCast(entry.getKey()), typeCast(entry.getValue()));
         }
@@ -333,14 +336,37 @@ public class HbaseDaoSupport<T extends HbaseBaseDo> {
         }
     }
 
+    /**
+     * handle json field of (T) obj
+     * @param stu    [in/out]
+     * @param field, with annotation JsonField
+     * @param result
+     * @throws IllegalAccessException
+     */
     private void parseJsonBytes(T stu, Field field, Result result) throws IllegalAccessException {
+        if (!field.isAnnotationPresent(Column.class)) {
+            return;
+        }
         Column column = field.getAnnotation(Column.class);
+        if (column.qualifier().isEmpty() || column.family().isEmpty()) {
+            return;
+        }
         byte[] val = result.getValue(column.family().getBytes(), column.qualifier().getBytes());
-        field.set(stu, JSON.parseObject(new String(val), field.getType()));
+        if (val == null) {
+            return;
+        }
+        Class eleClz = field.getAnnotation(JsonField.class).elementClass();
+        field.set(stu, JSON.parseArray(new String(val), eleClz));
     }
 
     private void parseMap(T stu, Field field, Result result) throws IllegalAccessException {
+        if (!field.isAnnotationPresent(Column.class)){
+            return;
+        }
         Column column = field.getAnnotation(Column.class);
+        if (column.family().isEmpty()){
+            return;
+        }
         MapField mapFieldAnnotation = field.getAnnotation(MapField.class);
         Class<?> keyClz = mapFieldAnnotation.keyClass();
         Class<?> valClz = mapFieldAnnotation.valueClass();
@@ -360,7 +386,9 @@ public class HbaseDaoSupport<T extends HbaseBaseDo> {
             parseMap(obj, field, result);
         } else {
             byte[] val = result.getValue(column.family().getBytes(), column.qualifier().getBytes());
-
+            if (val == null) {
+                return;
+            }
             Class type = field.getType();
             if (type.equals(Integer.class)) {
                 field.set(obj, Bytes.toInt(val));
